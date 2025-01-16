@@ -10,11 +10,11 @@
 
 // LED configuration
 #define LED_PIN        14         // GPIO pin connected to the NeoPixel strip (D5)
-#define NUM_LEDS       16         // Number of LEDs in the strip (Adjust as needed)
-#define DEFAULT_BRIGHTNESS 50     // Default Brightness (0-255)
+#define NUM_LEDS       50         // Number of LEDs in the strip (Adjust as needed)
+#define DEFAULT_BRIGHTNESS 5     // Default Brightness (0-255)
 
 // Initialize NeoPixel strip
-Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_BGR + NEO_KHZ800);
 
 // Constants
 const int MAX_PLAYERS = 8;
