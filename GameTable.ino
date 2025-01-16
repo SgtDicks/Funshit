@@ -1,468 +1,234 @@
-/*
-  Game Table Control - NodeMCU with NeoPixel LEDs and mDNS
-  Hostname: gametable.local
-
-  Features:
-  - Connects to stored WiFi networks
-  - Provides a web interface to control LEDs, brightness, colors, animations
-  - Uses mDNS to allow discovery via gametable.local
-  - Displays an initial LED pattern, holds for 10 seconds, then displays the IP address via LEDs
-
-  Libraries Required:
-  - Adafruit NeoPixel
-  - ESP8266WiFi
-  - ESP8266WebServer
-  - ESP8266mDNS
-  - EEPROM
-
-  Ensure you have the latest ESP8266 Arduino Core installed.
-*/
-
 #include <Adafruit_NeoPixel.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h> // Include mDNS library
-#include <EEPROM.h>
+#include <DNSServer.h>
+#include <WiFiManager.h> // Optional but recommended
 
 // =========================
-// Global Constant Definitions
+// Configuration Parameters
 // =========================
 
-const int MAX_WIFI_NETWORKS = 2;        // Maximum number of WiFi networks to store
-const int MAX_PLAYERS = 8;              // Maximum number of players
-const int SSID_MAX_LEN = 32;             // Maximum SSID length
-const int PASS_MAX_LEN = 64;             // Maximum Password length
+// LED configuration
+#define LED_PIN        14         // GPIO pin connected to the NeoPixel strip (D5)
+#define NUM_LEDS       16         // Number of LEDs in the strip (Adjust as needed)
+#define DEFAULT_BRIGHTNESS 50     // Default Brightness (0-255)
 
-const int LED_PIN = 14;                  // GPIO pin connected to the NeoPixel strip (D5)
-const int NUM_LEDS = 50;                 // Number of LEDs in the strip
-
-// =========================
-// Enumerations
-// =========================
-
-enum AnimationState { NONE, RAINBOW, THEATER_CHASE, BREATHING };
-
-// =========================
-// Global Variables
-// =========================
-
-int numPlayers = 1;                       // Default number of players
-int brightnessLevel = 50;                 // Current brightness level (0-255)
-
+// Initialize NeoPixel strip
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-ESP8266WebServer server(80);              // Create a web server object that listens on port 80
+// Constants
+const int MAX_PLAYERS = 8;
+int numPlayers = 1;                     // Default number of players
+int brightness = DEFAULT_BRIGHTNESS;    // Current brightness level
+int activePlayer = -1;                  // No active player initially
 
-// WiFi Credentials Management
-struct WiFiCredentials {
-  char ssid[SSID_MAX_LEN];
-  char password[PASS_MAX_LEN];
+// WiFiManager instance
+WiFiManager wifiManager;
+
+// Create an instance of the web server
+ESP8266WebServer server(80);
+
+// =========================
+// Function Prototypes
+// =========================
+void handleRoot();
+void handleSetPlayers();
+void handleResetAll();
+void handleSetBrightness();
+void handleSetActivePlayer();
+void handleSetColors();
+void handleSetAnimationColors(); // Newly added handler
+void handleStartAnimation();
+void handleNotFound();
+void printMainMenu();
+void printSetPlayers();
+void updateLEDsBasedOnPlayers();
+uint8_t getRed(uint32_t color);
+uint8_t getGreen(uint32_t color);
+uint8_t getBlue(uint32_t color);
+
+// =========================
+// Variables for LED Animations
+// =========================
+enum AnimationType {
+    NONE,
+    RAINBOW,
+    THEATER_CHASE,
+    BREATHING
 };
+AnimationType currentAnimation = NONE;
 
-// Animation Control Variables
-AnimationState currentAnimation = NONE;
-uint32_t playerColors[MAX_PLAYERS] = {0}; // Colors for each player (10 players)
-int activePlayer = -1;                      // Active player (1 to MAX_PLAYERS), -1 for none
-int activePlayerStartLED = -1;              // Start LED index for active player
-int activePlayerEndLED = -1;                // End LED index for active player
-uint32_t theaterChaseColor = 0xFFFFFF;      // Default Theater Chase color (White)
-uint32_t breathingColor = 0xFFFFFF;         // Default Breathing color (White)
+// Variables for Rainbow Animation
+uint16_t rainbowHue = 0;
 
-// Fading Effect Variables
-unsigned long lastFadeUpdate = 0;
-const unsigned long fadeInterval = 100;     // in milliseconds
+// Variables for Theater Chase Animation
+int chaseStep = 0;
+unsigned long lastChaseUpdate = 0;
+
+// Variables for Breathing Effect
+float breathPhase = 0.0;
+unsigned long lastBreathUpdate = 0;
+
+// Variables for Active Player Fading
 float fadeValue = 1.0;
 bool fadingOut = false;
+unsigned long lastFadeUpdate = 0;
+const long fadeInterval = 50;           // milliseconds between fade steps
+
+// Define distinct colors for up to 8 players
+uint32_t playerColors[MAX_PLAYERS] = {
+    0xFF0000, // Player 1: Red
+    0x00FF00, // Player 2: Green
+    0x0000FF, // Player 3: Blue
+    0xFFFF00, // Player 4: Yellow
+    0xFF00FF, // Player 5: Magenta
+    0x00FFFF, // Player 6: Cyan
+    0xFFA500, // Player 7: Orange
+    0x800080  // Player 8: Purple
+};
+
+// Animation Colors
+uint32_t theaterChaseColor = strip.Color(127, 127, 127); // Default: White
+uint32_t breathingColor = strip.Color(255, 255, 255);     // Default: White
+
+// LED range for active player
+int activePlayerStartLED = -1;
+int activePlayerEndLED = -1;
 
 // =========================
-// WiFi Credentials Management Functions
+// Setup Function
 // =========================
+void setup() {
+    // Initialize Serial Monitor for debugging
+    Serial.begin(115200);
+    Serial.println("\n[System] Initializing...");
 
-// Save a network to EEPROM
-bool saveNetwork(int index, const char* ssid, const char* password) {
-  if(index >= MAX_WIFI_NETWORKS) return false;
+    // Initialize NeoPixel strip
+    strip.begin();
+    strip.setBrightness(brightness);
+    strip.show(); // Initialize all pixels to 'off'
+    Serial.println("[LED] NeoPixel strip initialized.");
 
-  int addr = index * (SSID_MAX_LEN + PASS_MAX_LEN);
+    // Initialize WiFiManager
+    // Uncomment the following line to reset saved WiFi credentials (for debugging)
+    // wifiManager.resetSettings();
 
-  // Clear previous data
-  for(int i = 0; i < SSID_MAX_LEN + PASS_MAX_LEN; i++) {
-    EEPROM.write(addr + i, 0);
-  }
-
-  // Write SSID
-  for(int i = 0; i < SSID_MAX_LEN && ssid[i] != '\0'; i++) {
-    EEPROM.write(addr + i, ssid[i]);
-  }
-
-  // Write Password
-  for(int i = 0; i < PASS_MAX_LEN && password[i] != '\0'; i++) {
-    EEPROM.write(addr + SSID_MAX_LEN + i, password[i]);
-  }
-
-  EEPROM.commit();
-  Serial.println("[EEPROM] Saved Network " + String(index + 1) + ": " + String(ssid));
-  return true;
-}
-
-// Load a network from EEPROM
-WiFiCredentials loadNetwork(int index) {
-  WiFiCredentials creds;
-  memset(&creds, 0, sizeof(creds));
-
-  if(index >= MAX_WIFI_NETWORKS) return creds;
-
-  int addr = index * (SSID_MAX_LEN + PASS_MAX_LEN);
-
-  // Read SSID
-  for(int i = 0; i < SSID_MAX_LEN; i++) {
-    creds.ssid[i] = char(EEPROM.read(addr + i));
-    if(creds.ssid[i] == 0) break;
-  }
-
-  // Read Password
-  for(int i = 0; i < PASS_MAX_LEN; i++) {
-    creds.password[i] = char(EEPROM.read(addr + SSID_MAX_LEN + i));
-    if(creds.password[i] == 0) break;
-  }
-
-  return creds;
-}
-
-// Delete a network
-bool deleteNetwork(int index) {
-  if(index >= MAX_WIFI_NETWORKS) return false;
-  return saveNetwork(index, "", "");
-}
-
-// =========================
-// EEPROM Setup Function
-// =========================
-
-void setupEEPROM() {
-    EEPROM.begin(512); // Allocate 512 bytes for EEPROM
-    Serial.println("[EEPROM] Initialized with 512 bytes.");
-}
-
-// =========================
-// Connection Strategy
-// =========================
-
-bool connectToNetworks() {
-  for(int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-    WiFiCredentials creds = loadNetwork(i);
-    if(strlen(creds.ssid) == 0) continue; // Skip empty entries
-
-    Serial.print("[WiFi] Attempting to connect to: ");
-    Serial.println(creds.ssid);
-    WiFi.begin(creds.ssid, creds.password);
-
-    // Wait for connection
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) { // 20 * 500ms = 10 seconds
-      delay(500);
-      Serial.print(".");
-      attempts++;
+    // Attempt to connect to WiFi; if not, start AP mode
+    if(!wifiManager.autoConnect("Game_Table", "password")) {
+        Serial.println("[WiFi] Failed to connect and hit timeout");
+        // Reset and try again
+        ESP.reset();
+        delay(1000);
     }
-    Serial.println();
 
-    if(WiFi.status() == WL_CONNECTED){
-      Serial.print("[WiFi] Connected to ");
-      Serial.println(creds.ssid);
-      return true;
+    Serial.println("[WiFi] Connected to WiFi!");
+    Serial.print("[WiFi] IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Configure web server routes
+    server.on("/", handleRoot);
+    server.on("/set_players", handleSetPlayers);
+    server.on("/reset_all", handleResetAll);
+    server.on("/set_brightness", handleSetBrightness);
+    server.on("/set_active_player", handleSetActivePlayer);
+    server.on("/set_colors", handleSetColors);
+    server.on("/set_animation_colors", handleSetAnimationColors); // <-- Added
+    server.on("/start_animation", handleStartAnimation);
+    server.onNotFound(handleNotFound);
+    Serial.println("[Web Server] Handlers configured.");
+
+    // Start the web server
+    server.begin();
+    Serial.println("[Web Server] HTTP server started");
+
+    // Display the main menu on Serial Monitor
+    printMainMenu();
+    Serial.println("[Menu] Main menu displayed.");
+
+    // Initialize LEDs to white
+    for(int i = 0; i < NUM_LEDS; i++) {
+        strip.setPixelColor(i, strip.Color(255, 255, 255)); // White
     }
-    else{
-      Serial.print("[WiFi] Failed to connect to ");
-      Serial.println(creds.ssid);
-    }
-  }
-  return false;
+    strip.show();
+    Serial.println("[LED] All LEDs set to white.");
 }
 
 // =========================
-// LED Control Functions
+// Loop Function
 // =========================
+void loop() {
+    // Handle web server requests
+    server.handleClient();
 
-// Helper functions to extract color components
-uint8_t getRed(uint32_t color) {
-    return (color >> 16) & 0xFF;
-}
-
-uint8_t getGreen(uint32_t color) {
-    return (color >> 8) & 0xFF;
-}
-
-uint8_t getBlue(uint32_t color) {
-    return color & 0xFF;
-}
-
-// Update LED colors based on the number of players and their assigned colors
-void updateLEDsBasedOnPlayers() {
-    if (numPlayers > MAX_PLAYERS) numPlayers = MAX_PLAYERS;
-    if (numPlayers < 1) numPlayers = 1;
-
-    if(numPlayers ==1){
-        // Set all LEDs to the single player's color
-        for(int i = 0; i < NUM_LEDS; i++) {
-            strip.setPixelColor(i, playerColors[0]); // Player 1
-        }
-        if(activePlayer ==1){
-            activePlayerStartLED = 0;
-            activePlayerEndLED = NUM_LEDS -1;
-        }
-        else{
-            activePlayerStartLED = -1;
-            activePlayerEndLED = -1;
+    // Handle ongoing animations
+    if (currentAnimation != NONE) {
+        switch (currentAnimation) {
+            case RAINBOW:
+                rainbowCycle();
+                break;
+            case THEATER_CHASE:
+                theaterChase(theaterChaseColor, 50); // Customizable color
+                break;
+            case BREATHING:
+                breathingEffect(breathingColor);    // Customizable color
+                break;
+            default:
+                break;
         }
     }
-    else{
-        // Split LEDs among players with distinct colors
-        int ledsPerPlayer = NUM_LEDS / numPlayers;
-        int remainingLEDs = NUM_LEDS % numPlayers;
+    else if (activePlayer != -1) { // If an active player is set and no animation is running
+        unsigned long currentTime = millis();
 
-        int currentLED = 0;
-        activePlayerStartLED = -1;
-        activePlayerEndLED = -1;
+        if (currentTime - lastFadeUpdate >= fadeInterval) {
+            lastFadeUpdate = currentTime;
 
-        for(int i = 0; i < numPlayers; i++) {
-            int ledsToSet = ledsPerPlayer + (i < remainingLEDs ? 1 : 0); // Distribute remaining LEDs
-            for(int j = 0; j < ledsToSet; j++) {
-                if(currentLED < NUM_LEDS){
-                    strip.setPixelColor(currentLED, playerColors[i]);
-                    currentLED++;
+            if (!fadingOut) {
+                fadeValue -= 0.05;
+                if (fadeValue <= 0.1) { // Minimum brightness scale
+                    fadeValue = 0.1;
+                    fadingOut = true;
+                }
+            }
+            else {
+                fadeValue += 0.05;
+                if (fadeValue >= 1.0) { // Maximum brightness scale
+                    fadeValue = 1.0;
+                    fadingOut = false;
                 }
             }
 
-            // If this player is active, store their LED range
-            if((i+1) == activePlayer){
-                activePlayerStartLED = currentLED - ledsToSet;
-                activePlayerEndLED = currentLED -1;
-            }
-        }
+            // Update active player's LEDs with fading effect
+            if (activePlayerStartLED != -1 && activePlayerEndLED != -1) {
+                for(int i = activePlayerStartLED; i <= activePlayerEndLED && i < NUM_LEDS; i++) {
+                    uint32_t baseColor = playerColors[activePlayer -1]; // players are 1-indexed
 
-        // Turn off any remaining LEDs (if any)
-        while(currentLED < NUM_LEDS){
-            strip.setPixelColor(currentLED, strip.Color(0, 0, 0));
-            currentLED++;
+                    uint8_t r = getRed(baseColor) * fadeValue;
+                    uint8_t g = getGreen(baseColor) * fadeValue;
+                    uint8_t b = getBlue(baseColor) * fadeValue;
+
+                    strip.setPixelColor(i, strip.Color(r, g, b));
+                }
+                strip.show();
+            }
         }
     }
 
-    strip.show();
-    Serial.println("[LED] Updated LED colors based on number of players.");
-}
-
-// Rainbow Cycle Animation
-void rainbowCycle() {
-    static unsigned long lastRainbowUpdate = 0;
-    static uint16_t currentHue = 0;
-
-    unsigned long currentTime = millis();
-    if (currentTime - lastRainbowUpdate >= 20) { // Adjust speed as needed
-        lastRainbowUpdate = currentTime;
-
-        for(int i = 0; i < NUM_LEDS; i++) {
-            uint32_t color = strip.ColorHSV(((i * 65536L / NUM_LEDS) + currentHue) & 0xFFFF);
-            strip.setPixelColor(i, color);
-        }
-        strip.show();
-
-        currentHue += 256; // Adjust for speed and color change
-    }
-}
-
-// Theater Chase Animation with Custom Color
-void theaterChase(uint32_t color, int wait) {
-    static unsigned long lastChaseUpdate = 0;
-    static int chaseStep = 0;
-
-    unsigned long currentTime = millis();
-    if (currentTime - lastChaseUpdate >= wait) { // Adjust speed as needed
-        lastChaseUpdate = currentTime;
-
-        for(int i = 0; i < NUM_LEDS; i++) {
-            if((i + chaseStep) % 3 == 0){
-                strip.setPixelColor(i, color);
-            }
-            else{
-                strip.setPixelColor(i, 0); // Off
-            }
-        }
-        strip.show();
-
-        chaseStep++;
-        if(chaseStep >= 3){
-            chaseStep = 0;
-        }
-    }
-}
-
-// Breathing Effect Animation with Custom Color
-void breathingEffect(uint32_t color) {
-    static unsigned long lastBreathUpdate = 0;
-    static float breathPhase = 0.0;
-
-    unsigned long currentTime = millis();
-    if (currentTime - lastBreathUpdate >= 30) { // Adjust for smoothness
-        lastBreathUpdate = currentTime;
-
-        breathPhase += 0.05;
-        if(breathPhase > 2.0 * PI){
-            breathPhase -= 2.0 * PI;
-        }
-
-        // Calculate brightness scaling using sine wave
-        float scale = (sin(breathPhase) + 1.0) / 2.0 * (1.0 - 0.3) + 0.3; // Scale between 0.3 and 1.0
-
-        // Apply scaling to all LEDs with the selected breathing color
-        for(int i = 0; i < NUM_LEDS; i++) {
-            uint8_t r = getRed(color) * scale;
-            uint8_t g = getGreen(color) * scale;
-            uint8_t b = getBlue(color) * scale;
-            strip.setPixelColor(i, strip.Color(r, g, b));
-        }
-        strip.show();
-    }
-}
-
-// =========================
-// Function to Display Initial LED Pattern
-// =========================
-
-void displayInitialPattern(){
-    // Define the pattern: 'X' = On, 'o' = Off
-    // Example pattern: XoXXXXXXXXXoXXXX (16 LEDs)
-    String pattern = "XoXXXXXXXXXoXXXX";
-
-    for(int i=0; i<NUM_LEDS; i++){
-        if(i < pattern.length() && pattern[i] == 'X'){
-            strip.setPixelColor(i, strip.Color(255, 255, 255)); // White
-        }
-        else{
-            strip.setPixelColor(i, 0); // Off
-        }
-    }
-    strip.show();
-    Serial.println("[LED] Displayed initial pattern.");
-}
-
-// =========================
-// Function to Display IP Address via LEDs
-// =========================
-
-void displayIPAddress(String ip) {
-    Serial.println("[LED] Displaying IP Address via LEDs...");
-
-    // Split IP into octets
-    int firstDot = ip.indexOf('.');
-    int secondDot = ip.indexOf('.', firstDot + 1);
-    int thirdDot = ip.indexOf('.', secondDot + 1);
-
-    String octet1 = ip.substring(0, firstDot);
-    String octet2 = ip.substring(firstDot +1, secondDot);
-    String octet3 = ip.substring(secondDot +1, thirdDot);
-    String octet4 = ip.substring(thirdDot +1);
-
-    // Function to flash a single digit
-    auto flashDigit = [&](int num, uint32_t color) {
-        if(num > 0 && num <= NUM_LEDS){
-            // Turn on 'num' LEDs in the specified color
-            for(int i = 0; i < num; i++){
-                strip.setPixelColor(i, color);
-            }
-            strip.show();
-            delay(1000); // Duration of flash
-
-            // Turn off the LEDs
-            for(int i = 0; i < num; i++){
-                strip.setPixelColor(i, 0);
-            }
-            strip.show();
-            delay(300); // Pause between flashes
-        }
-        else{
-            // Handle '0' as no LEDs flashing (or implement a minimal indicator)
-            delay(00); // Duration of flash (can be adjusted)
-            delay(300); // Pause between flashes
-        }
-    };
-
-    // Function to perform long flashes
-    auto longFlashes = [&]() {
-        for(int i =0; i <1; i++){
-            // All LEDs on in White
-            for(int j =0; j < NUM_LEDS; j++){
-                strip.setPixelColor(j, strip.Color(2,20,255));
-            }
-            strip.show();
-            delay(500); // Duration of long flash
-
-            // All LEDs off
-            for(int j =0; j < NUM_LEDS; j++){
-                strip.setPixelColor(j, 0);
-            }
-            strip.show();
-            delay(500); // Pause between flashes
-        }
-    };
-
-    // Function to process an octet (flashing digits)
-    auto processOctet = [&](String octet, bool isRed) {
-        uint32_t color = isRed ? strip.Color(255, 0, 0) : strip.Color(255, 255, 255); // Red or White
-        for(char c : octet){
-            if(isDigit(c)){
-                int num = c - '0';
-                Serial.println("[LED] Flashing digit: " + String(num));
-                flashDigit(num, color);
-            }
-            else{
-                // Handle dot or any other non-digit characters
-                delay(300); // Pause between octets
-            }
-        }
-    };
-
-    // Flash first 3 octets in Red
-    Serial.println("[LED] Flashing first 3 octets in Red.");
-    processOctet(octet1, true);
-    delay(500); // Pause between octets
-    processOctet(octet2, true);
-    delay(500);
-    processOctet(octet3, true);
-
-    // Perform 5 long flashes in White
-    Serial.println("[LED] Performing 5 long flashes.");
-    longFlashes();
-
-    // Flash the fourth octet in White
-    Serial.println("[LED] Flashing fourth octet in White.");
-    processOctet(octet4, false);
-}
-
-// =========================
-// mDNS Setup Function with gametable.local
-// =========================
-
-void setupMDNS() {
-    if (!MDNS.begin("gametable")) { // Set hostname to "gametable"
-        Serial.println("[mDNS] Error setting up MDNS responder!");
-        return;
-    }
-    Serial.println("[mDNS] mDNS responder started with hostname: gametable.local");
-    // Register the HTTP service
-    MDNS.addService("http", "tcp", 80);
+    // Small delay to prevent excessive CPU usage
+    delay(1);
 }
 
 // =========================
 // Web Server Handlers
 // =========================
 
-// Root Page Handler
-void handleRootPage() {
+// Root handler: serves the main web page
+void handleRoot() {
     String html = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>";
     html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
     html += "<title>Game Table Control</title>";
     // Add Google Fonts
     html += "<link href='https://fonts.googleapis.com/css?family=Roboto:400,700&display=swap' rel='stylesheet'>";
-    // Add enhanced styling
+    // Add some enhanced styling
     html += "<style>"
             "body { font-family: 'Roboto', sans-serif; background-color: #1e1e1e; color: #f0f0f0; margin: 0; padding: 0; }"
             "header { background-color: #333; padding: 20px; text-align: center; }"
@@ -504,8 +270,8 @@ void handleRootPage() {
     html += "<div class='section'>";
     html += "<h2>Brightness Control</h2>";
     html += "<div class='slider-container'>";
-    html += "<label for='brightness' class='label'>Brightness: " + String(brightnessLevel) + "</label>";
-    html += "<input type='range' id='brightness' name='brightness' min='0' max='255' value='" + String(brightnessLevel) + "' onchange=\"updateBrightness(this.value)\">";
+    html += "<label for='brightness' class='label'>Brightness: " + String(brightness) + "</label>";
+    html += "<input type='range' id='brightness' name='brightness' min='0' max='255' value='" + String(brightness) + "' onchange=\"updateBrightness(this.value)\">";
     html += "</div>";
     html += "</div>";
 
@@ -515,7 +281,7 @@ void handleRootPage() {
     html += "<select id='activePlayer' name='activePlayer' onchange=\"setActivePlayer(this.value)\">";
     html += "<option value='0'>None</option>";
 
-    for(int i = 1; i <= numPlayers && i <= MAX_PLAYERS; i++) { // Up to 10 players
+    for(int i = 1; i <= numPlayers; i++) {
         if(i == activePlayer){
             html += "<option value='" + String(i) + "' selected>Player " + String(i) + "</option>";
         }
@@ -532,7 +298,7 @@ void handleRootPage() {
     html += "<h2>Set Player Colors</h2>";
     html += "<form id='colorForm' action='/set_colors' method='POST'>";
     html += "<div class='color-buttons'>";
-    for(int i = 1; i <= numPlayers && i <= MAX_PLAYERS; i++) { // Up to 10 players
+    for(int i = 1; i <= numPlayers; i++) {
         // Convert existing player color to HEX
         uint32_t color = playerColors[i-1];
         char hexColor[7];
@@ -555,7 +321,7 @@ void handleRootPage() {
     html += "<h2>Set Animation Colors</h2>";
     html += "<form id='animationColorForm' action='/set_animation_colors' method='POST'>";
     html += "<div class='color-buttons'>";
-
+    
     // Theater Chase Color Picker
     {
         // Convert existing animation color to HEX
@@ -606,32 +372,6 @@ void handleRootPage() {
     html += "</div>";
     html += "</div>";
 
-    // WiFi Configuration Section
-    html += "<div class='section'>";
-    html += "<h2>WiFi Configuration</h2>";
-    html += "<form id='wifiConfigForm' action='/wifi_config' method='POST'>";
-    html += "<div class='color-buttons'>"; // Reusing 'color-buttons' class for layout
-
-    for(int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-        WiFiCredentials creds = loadNetwork(i);
-        String ssidValue = String(creds.ssid);
-        String passValue = String(creds.password);
-
-        html += "<div class='color-picker'>";
-        html += "<label for='ssid" + String(i) + "'>SSID " + String(i + 1) + ":</label>";
-        html += "<input type='text' id='ssid" + String(i) + "' name='ssid" + String(i) + "' value='" + ssidValue + "' required>";
-        html += "<label for='password" + String(i) + "'>Password " + String(i + 1) + ":</label>";
-        html += "<input type='password' id='password" + String(i) + "' name='password" + String(i) + "' value='" + passValue + "'>";
-        html += "</div>";
-    }
-
-    html += "</div>";
-    html += "<div class='controls'>";
-    html += "<button type='submit'>💾 Save WiFi Settings</button>";
-    html += "</div>";
-    html += "</form>";
-    html += "</div>";
-
     // JavaScript for dynamic updates
     html += "<script>"
             "function updateBrightness(val) {"
@@ -658,7 +398,7 @@ void handleRootPage() {
     html += "</main></body></html>";
 
     server.send(200, "text/html", html);
-    Serial.println("[Web Server] Served Root Page with WiFi Config.");
+    Serial.println("[Web Server] Served Root Page.");
 }
 
 // Handler to set players (increase/decrease)
@@ -666,21 +406,17 @@ void handleSetPlayers() {
     if (server.hasArg("action")) {
         String action = server.arg("action");
         if (action == "inc") {
-            if(numPlayers < MAX_PLAYERS){
-                numPlayers++;
-                Serial.println("[Web] Increased number of players to " + String(numPlayers));
+            numPlayers++;
+            if (numPlayers > MAX_PLAYERS) {
+                numPlayers = MAX_PLAYERS;
             }
-            else{
-                Serial.println("[Web] Maximum number of players reached.");
-            }
+            Serial.println("[Web] Increased number of players to " + String(numPlayers));
         } else if (action == "dec") {
-            if(numPlayers > 1){
-                numPlayers--;
-                Serial.println("[Web] Decreased number of players to " + String(numPlayers));
+            numPlayers--;
+            if (numPlayers < 1) {
+                numPlayers = 1;
             }
-            else{
-                Serial.println("[Web] Minimum number of players is 1.");
-            }
+            Serial.println("[Web] Decreased number of players to " + String(numPlayers));
         }
         updateLEDsBasedOnPlayers();
 
@@ -723,10 +459,10 @@ void handleSetBrightness() {
         int newBrightness = server.arg("value").toInt();
         if (newBrightness < 0) newBrightness = 0;
         if (newBrightness > 255) newBrightness = 255;
-        brightnessLevel = newBrightness;
-        strip.setBrightness(brightnessLevel);
+        brightness = newBrightness;
+        strip.setBrightness(brightness);
         strip.show();
-        Serial.println("[Web] Brightness set to " + String(brightnessLevel));
+        Serial.println("[Web] Brightness set to " + String(brightness));
     }
     server.sendHeader("Location", "/");
     server.send(303);
@@ -759,7 +495,7 @@ void handleSetActivePlayer(){
 // Handler to set colors for each player
 void handleSetColors(){
     bool colorChanged = false;
-    for(int i = 1; i <= numPlayers && i <= MAX_PLAYERS; i++) {
+    for(int i = 1; i <= numPlayers; i++) {
         String colorArg = "player" + String(i) + "_color";
         if(server.hasArg(colorArg)){
             String colorHex = server.arg(colorArg);
@@ -865,36 +601,6 @@ void handleStartAnimation(){
     Serial.println("[Web Server] Handled start_animation action and redirected to Root.");
 }
 
-// Handler for WiFi Configuration Submission
-void handleWiFiConfig(){
-    Serial.println("[Web] Received WiFi Configuration Submission.");
-
-    for(int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-        String ssidArg = "ssid" + String(i);
-        String passArg = "password" + String(i);
-
-        if(server.hasArg(ssidArg) && server.hasArg(passArg)){
-            String ssid = server.arg(ssidArg);
-            String password = server.arg(passArg);
-
-            if(ssid.length() > 0){
-                saveNetwork(i, ssid.c_str(), password.c_str());
-            }
-            else{
-                deleteNetwork(i);
-            }
-        }
-    }
-
-    String html = "<!DOCTYPE html><html><head><title>Saved</title></head><body>";
-    html += "<h1>WiFi Settings Saved</h1>";
-    html += "<p>The device will reboot and attempt to connect to the configured networks.</p>";
-    html += "</body></html>";
-    server.send(200, "text/html", html);
-    delay(1000);
-    ESP.restart();
-}
-
 // Handler for undefined routes
 void handleNotFound() {
     String message = "404 Not Found\n\n";
@@ -904,139 +610,166 @@ void handleNotFound() {
 }
 
 // =========================
-// Setup Function
+// Menu Display Functions (Serial)
 // =========================
 
-void setup() {
-    // Initialize Serial Monitor for debugging
-    Serial.begin(115200);
-    Serial.println("\n[System] Initializing...");
+// Print the main menu to the Serial Monitor
+void printMainMenu() {
+    Serial.println("\n--- MAIN MENU ---");
+    Serial.println("1) Set Players");
+    Serial.println("2) Start Animation");
+    Serial.println("3) Reset All");
+    Serial.println("-----------------");
+}
 
-    // Initialize EEPROM
-    setupEEPROM();
-
-    // Initialize NeoPixel strip
-    strip.begin();
-    strip.setBrightness(brightnessLevel);
-    strip.show(); // Initialize all pixels to 'off'
-    Serial.println("[LED] NeoPixel strip initialized.");
-
-    // Initialize player colors with default values
-    playerColors[0] = strip.Color(255, 0, 0);    // Player 1 - Red
-    playerColors[1] = strip.Color(0, 255, 0);    // Player 2 - Green
-    playerColors[2] = strip.Color(0, 0, 255);    // Player 3 - Blue
-    playerColors[3] = strip.Color(255, 255, 0);  // Player 4 - Yellow
-    playerColors[4] = strip.Color(255, 0, 255);  // Player 5 - Magenta
-    playerColors[5] = strip.Color(0, 255, 255);  // Player 6 - Cyan
-    playerColors[6] = strip.Color(255, 165, 0);  // Player 7 - Orange
-    playerColors[7] = strip.Color(128, 0, 128);  // Player 8 - Purple
-    playerColors[8] = strip.Color(0, 128, 128);  // Player 9 - Teal
-    playerColors[9] = strip.Color(128, 128, 0);  // Player 10 - Olive
-
-    // Attempt to connect to stored networks
-    if(connectToNetworks()){
-        Serial.println("[System] Connected to WiFi.");
-
-        // Retrieve IP address
-        IPAddress ip = WiFi.localIP();
-        String ipAddress = String(ip[0]) + "." + String(ip[1]) + "." + String(ip[2]) + "." + String(ip[3]);
-        Serial.println("[WiFi] IP Address: " + ipAddress);
-
-        // Start mDNS after successful WiFi connection
-        setupMDNS();
-
-        // Display initial pattern and IP Address via LEDs
-        displayInitialPattern();
-        delay(10000); // 10 seconds
-        displayIPAddress(ipAddress);
-    }
-    else{
-        Serial.println("[System] Unable to connect to any stored WiFi networks.");
-        Serial.println("[System] Please configure WiFi from the web interface.");
-    }
-
-    // Define web server routes
-    server.on("/", handleRootPage);
-    server.on("/set_players", handleSetPlayers);
-    server.on("/reset_all", handleResetAll);
-    server.on("/set_brightness", handleSetBrightness);
-    server.on("/set_active_player", handleSetActivePlayer);
-    server.on("/set_colors", handleSetColors);
-    server.on("/set_animation_colors", handleSetAnimationColors);
-    server.on("/start_animation", handleStartAnimation);
-    server.on("/wifi_config", HTTP_POST, handleWiFiConfig);
-    server.onNotFound(handleNotFound);
-    server.begin();
-    Serial.println("[Web Server] HTTP server started on port 80");
-
-    // Initialize LEDs to white
-    for(int i = 0; i < NUM_LEDS; i++) {
-        strip.setPixelColor(i, strip.Color(255, 255, 255)); // White
-    }
-    strip.show();
-    Serial.println("[LED] All LEDs set to white.");
+// Print the set players menu to the Serial Monitor
+void printSetPlayers() {
+    Serial.println("\n--- SET PLAYERS ---");
+    Serial.print("Current number of players: ");
+    Serial.println(numPlayers);
+    Serial.println("Use the web interface to increase or decrease the number of players.");
+    Serial.println("--------------------");
 }
 
 // =========================
-// Loop Function
+// LED Control Functions
 // =========================
 
-void loop() {
-    server.handleClient();
+// Helper functions to extract color components
+uint8_t getRed(uint32_t color) {
+    return (color >> 16) & 0xFF;
+}
 
-    // Handle ongoing animations
-    if (currentAnimation != NONE) {
-        switch (currentAnimation) {
-            case RAINBOW:
-                rainbowCycle();
-                break;
-            case THEATER_CHASE:
-                theaterChase(theaterChaseColor, 50); // Customizable color
-                break;
-            case BREATHING:
-                breathingEffect(breathingColor);    // Customizable color
-                break;
-            default:
-                break;
+uint8_t getGreen(uint32_t color) {
+    return (color >> 8) & 0xFF;
+}
+
+uint8_t getBlue(uint32_t color) {
+    return color & 0xFF;
+}
+
+// Update LED colors based on the number of players and their assigned colors
+void updateLEDsBasedOnPlayers() {
+    if (numPlayers > MAX_PLAYERS) numPlayers = MAX_PLAYERS;
+    if (numPlayers < 1) numPlayers = 1;
+
+    if(numPlayers ==1){
+        // Set all LEDs to the single player's color
+        for(int i = 0; i < NUM_LEDS; i++) {
+            strip.setPixelColor(i, playerColors[0]); // Player 1
+        }
+        if(activePlayer ==1){
+            activePlayerStartLED = 0;
+            activePlayerEndLED = NUM_LEDS -1;
+        }
+        else{
+            activePlayerStartLED = -1;
+            activePlayerEndLED = -1;
         }
     }
-    else if (activePlayer != -1) { // If an active player is set and no animation is running
-        unsigned long currentTime = millis();
+    else{
+        // Split LEDs among players with distinct colors
+        int ledsPerPlayer = NUM_LEDS / numPlayers;
+        int remainingLEDs = NUM_LEDS % numPlayers;
 
-        if (currentTime - lastFadeUpdate >= fadeInterval) {
-            lastFadeUpdate = currentTime;
+        int currentLED = 0;
+        activePlayerStartLED = -1;
+        activePlayerEndLED = -1;
 
-            if (!fadingOut) {
-                fadeValue -= 0.05;
-                if (fadeValue <= 0.1) { // Minimum brightness scale
-                    fadeValue = 0.1;
-                    fadingOut = true;
-                }
-            }
-            else {
-                fadeValue += 0.05;
-                if (fadeValue >= 1.0) { // Maximum brightness scale
-                    fadeValue = 1.0;
-                    fadingOut = false;
+        for(int i = 0; i < numPlayers; i++) {
+            int ledsToSet = ledsPerPlayer + (i < remainingLEDs ? 1 : 0); // Distribute remaining LEDs
+            for(int j = 0; j < ledsToSet; j++) {
+                if(currentLED < NUM_LEDS){
+                    strip.setPixelColor(currentLED, playerColors[i]);
+                    currentLED++;
                 }
             }
 
-            // Update active player's LEDs with fading effect
-            if (activePlayerStartLED != -1 && activePlayerEndLED != -1) {
-                for(int i = activePlayerStartLED; i <= activePlayerEndLED && i < NUM_LEDS; i++) {
-                    uint32_t baseColor = playerColors[activePlayer -1]; // players are 1-indexed
-
-                    uint8_t r = getRed(baseColor) * fadeValue;
-                    uint8_t g = getGreen(baseColor) * fadeValue;
-                    uint8_t b = getBlue(baseColor) * fadeValue;
-
-                    strip.setPixelColor(i, strip.Color(r, g, b));
-                }
-                strip.show();
+            // If this player is active, store their LED range
+            if((i+1) == activePlayer){
+                activePlayerStartLED = currentLED - ledsToSet;
+                activePlayerEndLED = currentLED -1;
             }
+        }
+
+        // Turn off any remaining LEDs (if any)
+        while(currentLED < NUM_LEDS){
+            strip.setPixelColor(currentLED, strip.Color(0, 0, 0));
+            currentLED++;
         }
     }
 
-    // Small delay to prevent excessive CPU usage
-    delay(1);
+    strip.show();
+    Serial.println("[LED] Updated LED colors based on number of players.");
+}
+
+// =========================
+// Animation Functions
+// =========================
+
+// Rainbow Cycle Animation
+void rainbowCycle() {
+    static unsigned long lastRainbowUpdate = 0;
+    static uint16_t currentHue = 0;
+
+    unsigned long currentTime = millis();
+    if (currentTime - lastRainbowUpdate >= 20) { // Adjust speed as needed
+        lastRainbowUpdate = currentTime;
+
+        for(int i = 0; i < NUM_LEDS; i++) {
+            uint32_t color = strip.ColorHSV(((i * 65536L / NUM_LEDS) + currentHue) & 0xFFFF);
+            strip.setPixelColor(i, color);
+        }
+        strip.show();
+
+        currentHue += 256; // Adjust for speed and color change
+    }
+}
+
+// Theater Chase Animation with Custom Color
+void theaterChase(uint32_t color, int wait) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastChaseUpdate >= wait) { // Adjust speed as needed
+        lastChaseUpdate = currentTime;
+
+        for(int i = 0; i < NUM_LEDS; i++) {
+            if((i + chaseStep) % 3 == 0){
+                strip.setPixelColor(i, color);
+            }
+            else{
+                strip.setPixelColor(i, 0); // Off
+            }
+        }
+        strip.show();
+
+        chaseStep++;
+        if(chaseStep >= 3){
+            chaseStep = 0;
+        }
+    }
+}
+
+// Breathing Effect Animation with Custom Color
+void breathingEffect(uint32_t color) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastBreathUpdate >= 30) { // Adjust for smoothness
+        lastBreathUpdate = currentTime;
+
+        breathPhase += 0.05;
+        if(breathPhase > 2.0 * PI){
+            breathPhase -= 2.0 * PI;
+        }
+
+        // Calculate brightness scaling using sine wave
+        float scale = (sin(breathPhase) + 1.0) / 2.0 * (1.0 - 0.3) + 0.3; // Scale between 0.3 and 1.0
+
+        // Apply scaling to all LEDs with the selected breathing color
+        for(int i = 0; i < NUM_LEDS; i++) {
+            uint8_t r = getRed(color) * scale;
+            uint8_t g = getGreen(color) * scale;
+            uint8_t b = getBlue(color) * scale;
+            strip.setPixelColor(i, strip.Color(r, g, b));
+        }
+        strip.show();
+    }
 }
