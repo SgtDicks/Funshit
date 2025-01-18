@@ -7,7 +7,7 @@
 ## Features
 
 - **Dynamic Zone Lighting:** Each player's zone on the table is illuminated with distinct colors.
-- **Adjustable Zone Sizes:** Player zones can be customized between 50 cm and 100 cm to match the table's layout.
+- **Adjustable Zone Sizes:** Player zones can be customized to match the table's layout.
 - **Web Interface Control:** A ESP12-E hosts a web-based interface for the game master to control colors and zones.
 - **Visual Effects:** Includes animations and effects to enhance immersion during gameplay.
 
